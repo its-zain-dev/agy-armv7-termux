@@ -118,7 +118,11 @@ fi
 
 load_config
 [[ -n "$ARG_RAM" ]]  && VM_RAM="$ARG_RAM"
-[[ -n "$ARG_CPUS" ]] && VM_CPUS="$ARG_CPUS"
+if [[ -n "$ARG_CPUS" ]]; then
+  VM_CPUS="$ARG_CPUS"
+else
+  VM_CPUS="$(default_vm_cpus)"
+fi
 [[ -n "$ARG_PORT" ]] && VM_SSH_PORT="$ARG_PORT"
 [[ -d "$HOME/storage" ]] && AGY_STORAGE=1
 
@@ -205,10 +209,15 @@ for req in mke2fs ssh ssh-keygen curl tar gzip python3; do
 done
 qemu_bin_for_host >/dev/null || die "qemu-system-aarch64 not found."
 
+# Stop any previously running VM before rebuilding images
+if [[ -x "$BIN_DIR/agy-vm" ]]; then
+  "$BIN_DIR/agy-vm" stop --force >/dev/null 2>&1 || true
+fi
+
 # Step 2: Prepare directories, clean stale temp files, check free space & fetch artifacts
 mkdir -p "$DATA_DIR" "$CACHE_DIR" "$VM_DIR" "$SSH_DIR" "$BIN_DIR"
 chmod 0700 "$SSH_DIR"
-rm -rf "$VM_DIR"/staging.* "$CACHE_DIR"/*.part.* 2>/dev/null || true
+rm -rf "$VM_DIR"/staging.* "$VM_DIR"/initramfs-agy.gz "$CACHE_DIR"/*.part.* 2>/dev/null || true
 
 avail_mb="$(df -Pm "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
 if [[ "$avail_mb" =~ ^[0-9]+$ && "$avail_mb" -gt 0 ]]; then
@@ -222,11 +231,12 @@ fi
 download_agy_tarball
 download_alpine_assets
 
-# Step 3: Build custom initramfs with /init-agy
-info "Building initramfs with rdinit=/init-agy..."
+# Step 3: Build custom uncompressed initramfs with /init-agy (avoids slow emulated gunzip on boot)
+info "Building uncompressed initramfs with rdinit=/init-agy..."
 python3 "$REPO_DIR/lib/build_initrd.py" \
   --base "$FETCH_ALPINE_INITRAMFS" \
   --init "$REPO_DIR/guest/init-agy" \
+  --no-compress \
   --output "$INITRD_IMG"
 if (( KEEP_CACHE == 0 )); then
   rm -f "$FETCH_ALPINE_INITRAMFS"

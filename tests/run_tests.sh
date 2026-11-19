@@ -96,10 +96,20 @@ fi
 
 if python3 "$REPO_DIR/lib/build_initrd.py" \
      --verify "$INITRD_TEST_DIR/initramfs-agy.gz" \
-     --init "$REPO_DIR/guest/init-agy" | grep -q "mode=0o100755 uid=0 gid=0"; then
-  pass "build_initrd.py --verify mode=0o100755 uid=0 gid=0"
+     --init "$REPO_DIR/guest/init-agy" | grep -q "format=gzip.*mode=0o100755 uid=0 gid=0"; then
+  pass "build_initrd.py --verify gzip mode=0o100755 uid=0 gid=0"
 else
-  fail "build_initrd.py --verify"
+  fail "build_initrd.py --verify gzip"
+fi
+
+if python3 "$REPO_DIR/lib/build_initrd.py" \
+     --base "$INITRD_TEST_DIR/base.gz" \
+     --init "$REPO_DIR/guest/init-agy" \
+     --no-compress \
+     --output "$INITRD_TEST_DIR/initramfs-agy.img" | grep -q "format=cpio.*mode=0o100755 uid=0 gid=0"; then
+  pass "build_initrd.py --no-compress cpio build & verify"
+else
+  fail "build_initrd.py --no-compress"
 fi
 
 # 3. Environment detector matrix

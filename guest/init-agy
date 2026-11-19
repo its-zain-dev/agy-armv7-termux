@@ -4,37 +4,60 @@
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+# Alpine initramfs-virt ships busybox without applet symlinks; install them first!
+if [ -x /bin/busybox ]; then
+  BB=/bin/busybox
+elif [ -x /usr/bin/busybox ]; then
+  BB=/usr/bin/busybox
+else
+  echo "init-agy FATAL: busybox not found"
+  exit 1
+fi
+
+"$BB" mkdir -p /bin /sbin /usr/bin /usr/sbin /proc /sys /dev /sysroot /.modloop /lib/modules
+"$BB" --install -s
+
+# Ensure /dev/null and /dev/console exist before any redirections or devtmpfs mount
+[ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+
+log() {
+  echo "[init-agy] $*" >/dev/console 2>&1 || echo "[init-agy] $*"
+}
+
 fail() {
-  echo "init-agy FATAL: $*" >/dev/console 2>&1 || echo "init-agy FATAL: $*" >&2
+  log "FATAL: $*"
+  log "Block devices: $(ls -la /dev/vd* 2>&1 || true)"
+  log "Partitions: $(cat /proc/partitions 2>&1 || true)"
+  log "Filesystems: $(cat /proc/filesystems 2>&1 || true)"
   sync
-  sleep 5
+  sleep 2
   poweroff -f 2>/dev/null || exit 1
 }
 
-mkdir -p /proc /sys /dev /sysroot /.modloop /lib/modules
+log "starting early boot..."
 
-mount -t proc proc /proc || fail "failed to mount /proc"
-mount -t sysfs sysfs /sys || fail "failed to mount /sys"
-mount -t devtmpfs devtmpfs /dev || fail "failed to mount devtmpfs"
+mount -t sysfs -o noexec,nosuid,nodev sysfs /sys || fail "failed to mount /sys"
+mount -t devtmpfs -o exec,nosuid,mode=0755 devtmpfs /dev || fail "failed to mount devtmpfs"
+mount -t proc -o noexec,nosuid,nodev proc /proc || fail "failed to mount /proc"
 
-modprobe -a virtio_blk squashfs 2>/dev/null || true
+log "loading virtio and squashfs modules..."
+modprobe -a virtio_blk virtio_mmio squashfs loop 2>/dev/null || true
 
-# Poll up to 15 seconds (150 x 0.1s) for virtio block devices
+# Poll up to 30 seconds for /dev/vda (rootfs) and /dev/vdb (modloop)
 i=0
 while [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; do
-  if command -v mdev >/dev/null 2>&1; then
-    mdev -s 2>/dev/null || true
-  fi
+  mdev -s 2>/dev/null || true
   i=$((i + 1))
-  if [ "$i" -ge 150 ]; then
+  if [ "$i" -ge 60 ]; then
     fail "timed out waiting for /dev/vda and /dev/vdb"
   fi
-  sleep 0.1
+  sleep 0.5
 done
 
+log "mounting modloop (/dev/vdb) to load ext4..."
 mount -t squashfs -o ro /dev/vdb /.modloop || fail "failed to mount /dev/vdb modloop"
 
-# Locate module tree inside modloop (handles usr-merged or non-usr-merged layouts)
 moddir=""
 for cand in /.modloop/modules /.modloop/usr/lib/modules /.modloop/lib/modules; do
   if [ -d "$cand" ]; then
@@ -44,18 +67,19 @@ for cand in /.modloop/modules /.modloop/usr/lib/modules /.modloop/lib/modules; d
 done
 [ -n "$moddir" ] || fail "could not locate modules directory in /.modloop"
 
-mount --bind "$moddir" /lib/modules || fail "failed to bind-mount $moddir to /lib/modules"
+mount -o bind "$moddir" /lib/modules || fail "failed to bind-mount $moddir to /lib/modules"
 
-modprobe ext4 2>/dev/null || true
+modprobe ext4 || fail "modprobe ext4 failed"
 
 umount /lib/modules 2>/dev/null || true
 umount /.modloop 2>/dev/null || true
 
+log "mounting ext4 rootfs (/dev/vda)..."
 mount -t ext4 -o rw,noatime /dev/vda /sysroot || fail "failed to mount /dev/vda on /sysroot"
 
 # Hand live /dev into real rootfs so static device nodes are not required
 mkdir -p /sysroot/dev
-mount --move /dev /sysroot/dev || fail "failed to move /dev to /sysroot/dev"
+mount -o move /dev /sysroot/dev || fail "failed to move /dev to /sysroot/dev"
 
 umount /proc 2>/dev/null || true
 umount /sys 2>/dev/null || true

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Pure-Python initramfs overlay builder and verifier for agy-armv7-termux.
 
-Appends a gzipped SVR4 newc (070701) cpio archive containing /init-agy
-(mode 0100755, uid 0, gid 0) onto Alpine's initramfs-virt image.
+Injects /init-agy (mode 0100755, uid 0, gid 0) as an SVR4 newc (070701) cpio
+entry on top of Alpine's initramfs-virt image. Supports both gzip-compressed
+concatenated output and uncompressed cpio output (--no-compress, which avoids
+emulated gzip decompression overhead inside QEMU TCG on ARMv7 devices).
 """
 
 import argparse
@@ -49,46 +51,75 @@ def make_newc_entry(name: str, mode: int, content: bytes) -> bytes:
     return head_padded + data_padded
 
 
-def build_initrd(base_path: str, init_path: str, output_path: str) -> None:
+def extract_cpio_streams(raw: bytes) -> list[bytes]:
+    """Extract one or more cpio archives from gzipped and/or uncompressed initramfs bytes."""
+    streams = []
+    buf = raw
+    while buf:
+        buf = buf.lstrip(b"\x00")
+        if not buf:
+            break
+        if buf[:2] == b"\x1f\x8b":
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out = d.decompress(buf) + d.flush()
+            streams.append(out)
+            buf = d.unused_data
+        elif buf[:6] == CPIO_MAGIC:
+            # Consume uncompressed newc cpio segments until end or gzip stream
+            pos = 0
+            total = len(buf)
+            while pos + 110 <= total:
+                while pos < total and buf[pos] == 0:
+                    pos += 1
+                if pos + 110 > total or buf[pos : pos + 6] != CPIO_MAGIC:
+                    break
+                filesize = int(buf[pos + 54 : pos + 62], 16)
+                namesize = int(buf[pos + 94 : pos + 102], 16)
+                name_start = pos + 110
+                name_end = name_start + namesize
+                name = buf[name_start : name_end - 1].decode("utf-8", errors="replace")
+                data_start = ((name_end + 3) // 4) * 4
+                data_end = data_start + filesize
+                pos = ((data_end + 3) // 4) * 4
+                if name == "TRAILER!!!":
+                    streams.append(buf[:pos])
+                    buf = buf[pos:]
+                    break
+            else:
+                raise ValueError("Unterminated uncompressed cpio stream")
+        else:
+            raise ValueError(f"Unexpected initramfs stream header: {buf[:6].hex()}")
+    return streams
+
+
+def build_initrd(base_path: str, init_path: str, output_path: str, no_compress: bool = False) -> None:
     with open(base_path, "rb") as f:
         base_bytes = f.read()
-    if len(base_bytes) < 2 or base_bytes[:2] != b"\x1f\x8b":
-        raise ValueError(f"Base initramfs is not gzip-compressed: {base_path}")
+    if len(base_bytes) < 6 or (base_bytes[:2] != b"\x1f\x8b" and base_bytes[:6] != CPIO_MAGIC):
+        raise ValueError(f"Base initramfs is neither gzip nor newc cpio: {base_path}")
 
     with open(init_path, "rb") as f:
         init_bytes = f.read()
     if not init_bytes:
         raise ValueError(f"Init script is empty: {init_path}")
 
-    cpio_payload = (
+    cpio_overlay = (
         make_newc_entry("init-agy", stat.S_IFREG | 0o755, init_bytes)
         + make_newc_entry("TRAILER!!!", 0, b"")
     )
-    overlay_gz = gzip.compress(cpio_payload, compresslevel=6, mtime=0)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     tmp_path = f"{output_path}.tmp.{os.getpid()}"
     with open(tmp_path, "wb") as f:
-        f.write(base_bytes)
-        f.write(overlay_gz)
+        if no_compress:
+            base_streams = extract_cpio_streams(base_bytes)
+            for s in base_streams:
+                f.write(_pad4(s))
+            f.write(_pad4(cpio_overlay))
+        else:
+            f.write(base_bytes)
+            f.write(gzip.compress(cpio_overlay, compresslevel=6, mtime=0))
     os.replace(tmp_path, output_path)
-
-
-def decompress_all_gzip_streams(raw: bytes) -> list[bytes]:
-    streams = []
-    buf = raw
-    while buf:
-        # Skip leading NUL padding between concatenated initramfs streams
-        buf = buf.lstrip(b"\x00")
-        if not buf:
-            break
-        if buf[:2] != b"\x1f\x8b":
-            raise ValueError(f"Unexpected non-gzip stream header: {buf[:4].hex()}")
-        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        out = d.decompress(buf) + d.flush()
-        streams.append(out)
-        buf = d.unused_data
-    return streams
 
 
 def parse_newc_entries(cpio_data: bytes) -> list[dict]:
@@ -96,7 +127,6 @@ def parse_newc_entries(cpio_data: bytes) -> list[dict]:
     pos = 0
     total = len(cpio_data)
     while pos + 110 <= total:
-        # Kernel skips NUL bytes before next cpio archive if concatenated
         while pos < total and cpio_data[pos] == 0:
             pos += 1
         if pos + 110 > total:
@@ -141,9 +171,9 @@ def verify_initrd(path: str, expected_init_path: str | None = None) -> None:
     with open(path, "rb") as f:
         raw = f.read()
 
-    streams = decompress_all_gzip_streams(raw)
+    streams = extract_cpio_streams(raw)
     if not streams:
-        raise ValueError("No gzip streams found in initramfs")
+        raise ValueError("No cpio streams found in initramfs")
 
     all_entries = []
     for s in streams:
@@ -165,8 +195,9 @@ def verify_initrd(path: str, expected_init_path: str | None = None) -> None:
         if target["content"] != expected_bytes:
             raise ValueError("init-agy content mismatch against source script")
 
+    kind = "gzip" if raw[:2] == b"\x1f\x8b" else "cpio"
     print(
-        f"OK: streams={len(streams)} entries={len(all_entries)} "
+        f"OK: format={kind} streams={len(streams)} entries={len(all_entries)} "
         f"init-agy mode={oct(target['mode'])} uid={target['uid']} gid={target['gid']} size={target['size']}"
     )
 
@@ -175,8 +206,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build or verify agy-armv7-termux initramfs")
     parser.add_argument("--base", help="Base initramfs-virt path")
     parser.add_argument("--init", help="Path to guest/init-agy")
-    parser.add_argument("--output", help="Output initramfs-agy.gz path")
-    parser.add_argument("--verify", help="Verify an existing initramfs-agy.gz file")
+    parser.add_argument("--output", help="Output initramfs path")
+    parser.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Write uncompressed newc cpio (faster guest kernel boot under QEMU TCG)",
+    )
+    parser.add_argument("--verify", help="Verify an existing initramfs file")
     args = parser.parse_args()
 
     if args.verify:
@@ -186,7 +222,7 @@ def main() -> int:
     if not args.base or not args.init or not args.output:
         parser.error("--base, --init, and --output are required when not using --verify")
 
-    build_initrd(args.base, args.init, args.output)
+    build_initrd(args.base, args.init, args.output, no_compress=args.no_compress)
     verify_initrd(args.output, args.init)
     return 0
 

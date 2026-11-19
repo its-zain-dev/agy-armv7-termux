@@ -23,7 +23,7 @@ SSH_PUB="$SSH_DIR/id_ed25519.pub"
 
 ROOTFS_IMG="$VM_DIR/rootfs.img"
 KERNEL_IMG="$VM_DIR/vmlinuz-virt"
-INITRD_IMG="$VM_DIR/initramfs-agy.gz"
+INITRD_IMG="$VM_DIR/initramfs-agy.img"
 MODLOOP_IMG="$VM_DIR/modloop-virt"
 
 # Colors when interactive
@@ -61,6 +61,14 @@ default_vm_ram() {
   else
     echo "1024M"
   fi
+}
+
+# Single vCPU on 32-bit ARM hosts avoids single-threaded TCG SMP round-robin overhead
+default_vm_cpus() {
+  case "${AGY_MOCK_UNAME_M:-$(uname -m)}" in
+    arm|armv7*|armv8l) echo "1" ;;
+    *)                 echo "2" ;;
+  esac
 }
 
 # Set defaults and load config file safely if present
@@ -101,7 +109,7 @@ load_config() {
   fi
 
   : "${VM_RAM:=$(default_vm_ram)}"
-  : "${VM_CPUS:=2}"
+  : "${VM_CPUS:=$(default_vm_cpus)}"
   : "${VM_ZRAM_MB:=512}"
   : "${VM_SSH_PORT:=22229}"
   : "${VM_DISK_MB:=2048}"

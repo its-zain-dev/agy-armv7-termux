@@ -44,12 +44,14 @@ AGY_STORAGE='$AGY_STORAGE'
 EOF
 export AGY_HOME AGY_TZ AGY_ZRAM_MB AGY_STORAGE
 
+log "started inside Alpine rootfs"
+
 # Mount modloop squashfs so kernel modules (9p, virtio_net, zram, etc.) are available
 if [ -b /dev/vdb ]; then
   mount -t squashfs -o ro /dev/vdb /.modloop 2>/dev/null || true
   for cand in /.modloop/modules /.modloop/usr/lib/modules /.modloop/lib/modules; do
     if [ -d "$cand" ]; then
-      mount --bind "$cand" /lib/modules 2>/dev/null || true
+      mount -o bind "$cand" /lib/modules 2>/dev/null || true
       break
     fi
   done
@@ -63,11 +65,21 @@ done
 hostname agy-arm64 2>/dev/null || true
 ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
 
+# Wait briefly for eth0 to appear after modprobe virtio_net
+i=0
+while ! ip link show eth0 >/dev/null 2>&1 && [ "$i" -lt 25 ]; do
+  sleep 0.2
+  i=$((i + 1))
+done
+
 if ip link show eth0 >/dev/null 2>&1; then
   ip addr flush dev eth0 2>/dev/null || true
   ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null || true
   ip link set eth0 up 2>/dev/null || true
-  ip route replace default via 10.0.2.2 dev eth0 2>/dev/null || route add default gw 10.0.2.2 eth0 2>/dev/null || true
+  ip route add default via 10.0.2.2 dev eth0 2>/dev/null || ip route replace default via 10.0.2.2 dev eth0 2>/dev/null || route add default gw 10.0.2.2 eth0 2>/dev/null || true
+  log "network eth0 configured (10.0.2.15)"
+else
+  log "warn: eth0 not found after modprobe virtio_net"
 fi
 
 cat > /etc/resolv.conf <<'EOF'
@@ -77,13 +89,16 @@ nameserver 1.1.1.1
 EOF
 
 # Configure zram swap so 512M-1G VMs handle agy memory spikes reliably
-if [ "${AGY_ZRAM_MB:-0}" -gt 0 ] 2>/dev/null && [ -b /dev/zram0 ]; then
-  swapoff /dev/zram0 2>/dev/null || true
-  echo 1 > /sys/block/zram0/reset 2>/dev/null || true
-  echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || echo lzo-rle > /sys/block/zram0/comp_algorithm 2>/dev/null || true
-  echo "${AGY_ZRAM_MB}M" > /sys/block/zram0/disksize 2>/dev/null || true
-  if mkswap /dev/zram0 >/dev/null 2>&1; then
-    swapon -p 100 /dev/zram0 2>/dev/null || true
+if [ "${AGY_ZRAM_MB:-0}" -gt 0 ] 2>/dev/null; then
+  [ -b /dev/zram0 ] || sleep 0.5
+  if [ -b /dev/zram0 ]; then
+    swapoff /dev/zram0 2>/dev/null || true
+    echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+    echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || echo lzo-rle > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    echo "$((AGY_ZRAM_MB * 1048576))" > /sys/block/zram0/disksize 2>/dev/null || echo "${AGY_ZRAM_MB}M" > /sys/block/zram0/disksize 2>/dev/null || true
+    if mkswap /dev/zram0 >/dev/null 2>&1; then
+      swapon -p 100 /dev/zram0 2>/dev/null || true
+    fi
   fi
 fi
 
@@ -103,8 +118,9 @@ fi
 mkdir -p "$AGY_HOME"
 if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=131072 hosthome /mnt/hosthome; then
   if [ "$AGY_HOME" != "/mnt/hosthome" ]; then
-    mount --bind /mnt/hosthome "$AGY_HOME" || log "warn: failed to bind /mnt/hosthome -> $AGY_HOME"
+    mount -o bind /mnt/hosthome "$AGY_HOME" || log "warn: failed to bind /mnt/hosthome -> $AGY_HOME"
   fi
+  log "hosthome mounted at $AGY_HOME"
 else
   log "warn: failed to mount 9p hosthome"
 fi
@@ -113,7 +129,7 @@ if [ "$AGY_STORAGE" = "1" ]; then
   mkdir -p /mnt/hoststorage
   if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=131072 hoststorage /mnt/hoststorage 2>/dev/null; then
     if [ -d "$AGY_HOME/storage" ] || mkdir -p "$AGY_HOME/storage" 2>/dev/null; then
-      mount --bind /mnt/hoststorage "$AGY_HOME/storage" 2>/dev/null || true
+      mount -o bind /mnt/hoststorage "$AGY_HOME/storage" 2>/dev/null || true
     fi
   fi
 fi
@@ -121,7 +137,7 @@ fi
 # Isolate ~/.gemini/antigravity-cli on VM ext4 so SQLite WAL/SHM works without 9pfs corruption
 mkdir -p /var/lib/agy-state "/mnt/hosthome/.gemini/antigravity-cli" "$AGY_HOME/.gemini/antigravity-cli"
 /usr/local/sbin/agy-sync-state pull || true
-mount --bind /var/lib/agy-state "$AGY_HOME/.gemini/antigravity-cli" || log "warn: failed to bind /var/lib/agy-state"
+mount -o bind /var/lib/agy-state "$AGY_HOME/.gemini/antigravity-cli" || log "warn: failed to bind /var/lib/agy-state"
 
 # Deferred extraction of Antigravity CLI binary directly into VM ext4 (avoids 228 MB host duplication)
 if [ ! -x /usr/local/bin/agy ] && [ -f /var/lib/agy-tarball.path ]; then

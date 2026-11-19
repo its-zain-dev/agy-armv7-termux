@@ -79,7 +79,7 @@ PY
 
 cmd_start() {
   local wait_ready=0
-  local timeout=240
+  local timeout=360
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --wait) wait_ready=1; shift ;;
@@ -99,11 +99,15 @@ cmd_start() {
       return 0
     fi
   else
-    [[ -f "$KERNEL_IMG" ]]  || die "Missing kernel image: $KERNEL_IMG"
-    [[ -f "$INITRD_IMG" ]]  || die "Missing initramfs image: $INITRD_IMG"
-    [[ -f "$ROOTFS_IMG" ]]  || die "Missing rootfs image: $ROOTFS_IMG"
-    [[ -f "$MODLOOP_IMG" ]] || die "Missing modloop image: $MODLOOP_IMG"
-    [[ -f "$SSH_KEY" ]]     || die "Missing SSH key: $SSH_KEY"
+    local active_initrd="$INITRD_IMG"
+    if [[ ! -f "$active_initrd" && -f "$VM_DIR/initramfs-agy.gz" ]]; then
+      active_initrd="$VM_DIR/initramfs-agy.gz"
+    fi
+    [[ -f "$KERNEL_IMG" ]]    || die "Missing kernel image: $KERNEL_IMG"
+    [[ -f "$active_initrd" ]] || die "Missing initramfs image: $active_initrd"
+    [[ -f "$ROOTFS_IMG" ]]    || die "Missing rootfs image: $ROOTFS_IMG"
+    [[ -f "$MODLOOP_IMG" ]]   || die "Missing modloop image: $MODLOOP_IMG"
+    [[ -f "$SSH_KEY" ]]       || die "Missing SSH key: $SSH_KEY"
 
     local qemu_bin
     qemu_bin="$(qemu_bin_for_host)" || die "qemu-system-aarch64 not found in PATH."
@@ -114,15 +118,22 @@ cmd_start() {
     local qemu_err="$DATA_DIR/qemu.stderr.log"
     : > "$qemu_err"
 
-    local virtfs_args=(-virtfs "local,path=${AGY_HOME},mount_tag=hosthome,security_model=none,id=hosthome")
+    # Explicit virtio-pci devices match built-in CONFIG_VIRTIO_PCI=y in Alpine linux-virt
+    local virtfs_args=(
+      -fsdev "local,id=hosthome,path=${AGY_HOME},security_model=none"
+      -device "virtio-9p-pci,fsdev=hosthome,mount_tag=hosthome"
+    )
     local storage_kopt=""
     if [[ "${AGY_STORAGE:-0}" == "1" && -d "${AGY_HOME}/storage" ]]; then
-      virtfs_args+=(-virtfs "local,path=${AGY_HOME}/storage,mount_tag=hoststorage,security_model=none,id=hoststorage")
+      virtfs_args+=(
+        -fsdev "local,id=hoststorage,path=${AGY_HOME}/storage,security_model=none"
+        -device "virtio-9p-pci,fsdev=hoststorage,mount_tag=hoststorage"
+      )
       storage_kopt=" agy_storage=1"
     fi
 
     local tz_val="${TZ:-UTC}"
-    local cmdline="console=ttyAMA0 quiet rdinit=/init-agy agy_home=${AGY_HOME} agy_tz=${tz_val} agy_zram=${VM_ZRAM_MB}${storage_kopt}"
+    local cmdline="console=ttyAMA0 loglevel=4 rdinit=/init-agy agy_home=${AGY_HOME} agy_tz=${tz_val} agy_zram=${VM_ZRAM_MB}${storage_kopt}"
 
     info "Starting Alpine aarch64 micro-VM (${VM_RAM} RAM, ${VM_CPUS} vCPU, zram ${VM_ZRAM_MB}M, port ${VM_SSH_PORT})..."
 
@@ -135,10 +146,12 @@ cmd_start() {
       -serial "file:$VM_LOG" \
       -monitor "unix:$MON_SOCK,server,nowait" \
       -kernel "$KERNEL_IMG" \
-      -initrd "$INITRD_IMG" \
+      -initrd "$active_initrd" \
       -append "$cmdline" \
-      -drive "file=$ROOTFS_IMG,if=virtio,format=raw,cache=writeback" \
-      -drive "file=$MODLOOP_IMG,if=virtio,format=raw,readonly=on" \
+      -drive "file=$ROOTFS_IMG,if=none,id=hd0,format=raw,cache=writeback" \
+      -device "virtio-blk-pci,drive=hd0" \
+      -drive "file=$MODLOOP_IMG,if=none,id=hd1,format=raw,readonly=on" \
+      -device "virtio-blk-pci,drive=hd1" \
       "${virtfs_args[@]}" \
       -netdev "user,id=net0,net=10.0.2.0/24,dhcpstart=10.0.2.15,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22" \
       -device virtio-net-pci,netdev=net0 \
@@ -158,15 +171,33 @@ cmd_start() {
   fi
 
   if (( wait_ready == 1 )); then
-    local start_ts now_ts elapsed prov_noted=0 extract_noted=0
+    local start_ts now_ts elapsed init_noted=0 root_noted=0 extract_noted=0 prov_noted=0
     start_ts="$(date +%s)"
     while ! is_ssh_ready; do
       if ! is_vm_running; then
         err "VM stopped unexpectedly during boot. Last log lines:"
-        tail -n 30 "$VM_LOG" >&2 || true
+        tail -n 35 "$VM_LOG" >&2 || true
         tail -n 20 "$DATA_DIR/qemu.stderr.log" >&2 || true
         rm -f "$PID_FILE" "$MON_SOCK"
         return 1
+      fi
+      if grep -qE "end Kernel panic|init-agy.*FATAL" "$VM_LOG" 2>/dev/null; then
+        err "Guest kernel panicked or init failed! Relevant console log:"
+        grep -B 15 -A 5 -E "FATAL|Kernel panic" "$VM_LOG" >&2 || tail -n 35 "$VM_LOG" >&2 || true
+        local dead_pid
+        dead_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        qemu_monitor_quit || true
+        [[ -n "$dead_pid" ]] && kill -TERM "$dead_pid" 2>/dev/null || true
+        rm -f "$PID_FILE" "$MON_SOCK"
+        return 1
+      fi
+      if (( init_noted == 0 )) && grep -q "\[init-agy\]" "$VM_LOG" 2>/dev/null; then
+        info "Guest kernel booted; mounting rootfs..."
+        init_noted=1
+      fi
+      if (( root_noted == 0 )) && grep -q "\[agy-init\] started" "$VM_LOG" 2>/dev/null; then
+        info "Alpine rootfs mounted; configuring network and 9pfs..."
+        root_noted=1
       fi
       if (( extract_noted == 0 )) && grep -q "AGY_VM_EXTRACTING_AGY" "$VM_LOG" 2>/dev/null; then
         info "First boot: extracting Antigravity CLI into VM..."
@@ -180,7 +211,7 @@ cmd_start() {
       elapsed=$((now_ts - start_ts))
       if (( elapsed >= timeout )); then
         err "Timed out after ${timeout}s waiting for VM SSH on 127.0.0.1:${VM_SSH_PORT}."
-        tail -n 20 "$VM_LOG" >&2 || true
+        tail -n 35 "$VM_LOG" >&2 || true
         return 1
       fi
       sleep 1
