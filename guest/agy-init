@@ -123,6 +123,41 @@ mkdir -p /var/lib/agy-state "/mnt/hosthome/.gemini/antigravity-cli" "$AGY_HOME/.
 /usr/local/sbin/agy-sync-state pull || true
 mount --bind /var/lib/agy-state "$AGY_HOME/.gemini/antigravity-cli" || log "warn: failed to bind /var/lib/agy-state"
 
+# Deferred extraction of Antigravity CLI binary directly into VM ext4 (avoids 228 MB host duplication)
+if [ ! -x /usr/local/bin/agy ] && [ -f /var/lib/agy-tarball.path ]; then
+  agy_tb="$(cat /var/lib/agy-tarball.path 2>/dev/null || true)"
+  if [ -n "$agy_tb" ] && [ -f "$agy_tb" ]; then
+    log "AGY_VM_EXTRACTING_AGY"
+    rm -rf /var/tmp/agy_ext
+    mkdir -p /var/tmp/agy_ext
+    if gzip -dc "$agy_tb" | tar -xf - -C /var/tmp/agy_ext; then
+      agy_src=""
+      if [ -f /var/tmp/agy_ext/antigravity ]; then
+        agy_src="/var/tmp/agy_ext/antigravity"
+      elif [ -f /var/tmp/agy_ext/agy ]; then
+        agy_src="/var/tmp/agy_ext/agy"
+      else
+        agy_src="$(find /var/tmp/agy_ext -maxdepth 3 -type f \( -name antigravity -o -name agy \) | head -n 1 || true)"
+      fi
+      if [ -n "$agy_src" ] && [ -f "$agy_src" ]; then
+        mv -f "$agy_src" /usr/local/bin/agy
+        chown 0:0 /usr/local/bin/agy 2>/dev/null || true
+        chmod 0755 /usr/local/bin/agy
+        rm -f /var/lib/agy-tarball.path
+        if [ "$agy_tb" = "/var/tmp/agy.tar.gz" ]; then
+          rm -f /var/tmp/agy.tar.gz
+        fi
+        log "AGY_VM_AGY_INSTALLED"
+      else
+        log "AGY_VM_AGY_EXTRACT_FAILED"
+      fi
+    else
+      log "AGY_VM_AGY_EXTRACT_FAILED"
+    fi
+    rm -rf /var/tmp/agy_ext
+  fi
+fi
+
 # First-boot package provisioning (Dropbear, bash, TLS certs, curl, git, ripgrep, coreutils, tzdata)
 if [ ! -f /var/lib/agy-provisioned ]; then
   log "AGY_VM_PROVISIONING"

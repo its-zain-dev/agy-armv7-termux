@@ -68,10 +68,33 @@ download_file_verified() {
     fi
   fi
 
-  local part="${dst}.part.$$"
-  rm -f "$part"
-  if ! curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$part" "$url"; then
+  # Clean any orphaned PID-suffixed temp files from older versions
+  rm -f "${dst}.part."* 2>/dev/null || true
+
+  local part="${dst}.part"
+  local curl_rc=0
+  set +e
+  curl -fL -C - --retry 3 --retry-delay 2 --progress-bar -o "$part" "$url"
+  curl_rc=$?
+  set -e
+
+  # If server rejected resume range (exit 33), retry cleanly from byte 0
+  if [[ "$curl_rc" -eq 33 ]]; then
     rm -f "$part"
+    set +e
+    curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$part" "$url"
+    curl_rc=$?
+    set -e
+  fi
+
+  if [[ "$curl_rc" -ne 0 ]]; then
+    if [[ "$curl_rc" -eq 23 ]]; then
+      rm -f "$part"
+      local avail_h
+      avail_h="$(df -h "$(dirname "$dst")" 2>/dev/null | awk 'NR==2 {print $4 " free of " $2}' || echo "unknown")"
+      err "Disk write failed (curl exit 23 — storage full). Space on $(dirname "$dst"): ${avail_h}."
+      err "Free at least ~400 MB of storage (e.g. run 'apt-get clean' or remove unused files) and re-run install.sh."
+    fi
     return 1
   fi
 

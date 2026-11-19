@@ -57,22 +57,22 @@ build_rootfs_image() {
     "$staging/usr/sbin" \
     "$staging/root/.ssh"
 
-  info "Installing Antigravity CLI binary into rootfs..."
-  local agy_extract="$staging/.agy_extract"
-  mkdir -p "$agy_extract"
-  tar -xzf "$agy_tarball" -C "$agy_extract" --no-same-owner
-  local agy_src=""
-  if [[ -f "$agy_extract/antigravity" ]]; then
-    agy_src="$agy_extract/antigravity"
-  elif [[ -f "$agy_extract/agy" ]]; then
-    agy_src="$agy_extract/agy"
+  # Defer extracting the ~228 MB agy binary until first boot inside the VM so we
+  # avoid duplicating 228 MB in $staging + 228 MB in rootfs.img on low-storage phones.
+  mkdir -p "$staging/var/tmp" "$staging/var/lib"
+  local agy_tar_abs agy_home_abs
+  agy_tar_abs="$(cd "$(dirname "$agy_tarball")" && pwd)/$(basename "$agy_tarball")"
+  agy_home_abs="$(cd "${AGY_HOME:-$HOME}" && pwd)"
+
+  if [[ "$agy_tar_abs" == "$agy_home_abs/"* ]]; then
+    local rel_tar="${agy_tar_abs#"$agy_home_abs"/}"
+    info "Staging deferred in-VM extraction for Antigravity CLI (zero host duplication)..."
+    printf '/mnt/hosthome/%s\n' "$rel_tar" > "$staging/var/lib/agy-tarball.path"
   else
-    agy_src="$(find "$agy_extract" -maxdepth 3 -type f \( -name antigravity -o -name agy \) | head -n 1 || true)"
+    info "Copying compressed Antigravity CLI tarball into rootfs for first-boot extraction..."
+    cp "$agy_tar_abs" "$staging/var/tmp/agy.tar.gz"
+    printf '/var/tmp/agy.tar.gz\n' > "$staging/var/lib/agy-tarball.path"
   fi
-  [[ -n "$agy_src" && -f "$agy_src" ]] || die "Could not find antigravity binary inside $agy_tarball"
-  mv -f "$agy_src" "$staging/usr/local/bin/agy"
-  chmod 0755 "$staging/usr/local/bin/agy"
-  rm -rf "$agy_extract"
 
   # Install guest init, exec, state sync, and poweroff scripts
   cp "$guest_dir/agy-init" "$staging/usr/sbin/agy-init"

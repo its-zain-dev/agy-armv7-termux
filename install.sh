@@ -59,6 +59,7 @@ ARG_PORT=""
 FORCE_VM=0
 NO_START=0
 SKIP_PKGS=0
+KEEP_CACHE=0
 DRY_RUN=0
 
 show_help() {
@@ -78,6 +79,7 @@ Options:
   --force-vm          Allow VM installation on 64-bit capable or non-Android hosts
   --no-start          Build VM images without booting on install
   --skip-pkgs         Skip Termux pkg install step
+  --keep-cache        Keep downloaded tarballs in cache after install
   --dry-run           Show resolved plan and exit without making changes
   -h, --help          Show this help message
 EOF
@@ -85,18 +87,19 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bin-dir)   BIN_DIR="$2"; shift 2 ;;
-    --bin-name)  BIN_NAME="$2"; shift 2 ;;
-    --data-dir)  ARG_DATA_DIR="$2"; shift 2 ;;
-    --ram)       ARG_RAM="$2"; shift 2 ;;
-    --cpus)      ARG_CPUS="$2"; shift 2 ;;
-    --port)      ARG_PORT="$2"; shift 2 ;;
-    --force-vm)  FORCE_VM=1; shift ;;
-    --no-start)  NO_START=1; shift ;;
-    --skip-pkgs) SKIP_PKGS=1; shift ;;
-    --dry-run)   DRY_RUN=1; shift ;;
-    -h|--help)   show_help; exit 0 ;;
-    *)           echo "Unknown option: $1" >&2; show_help >&2; exit 1 ;;
+    --bin-dir)    BIN_DIR="$2"; shift 2 ;;
+    --bin-name)   BIN_NAME="$2"; shift 2 ;;
+    --data-dir)   ARG_DATA_DIR="$2"; shift 2 ;;
+    --ram)        ARG_RAM="$2"; shift 2 ;;
+    --cpus)       ARG_CPUS="$2"; shift 2 ;;
+    --port)       ARG_PORT="$2"; shift 2 ;;
+    --force-vm)   FORCE_VM=1; shift ;;
+    --no-start)   NO_START=1; shift ;;
+    --skip-pkgs)  SKIP_PKGS=1; shift ;;
+    --keep-cache) KEEP_CACHE=1; shift ;;
+    --dry-run)    DRY_RUN=1; shift ;;
+    -h|--help)    show_help; exit 0 ;;
+    *)            echo "Unknown option: $1" >&2; show_help >&2; exit 1 ;;
   esac
 done
 
@@ -188,14 +191,33 @@ if (( SKIP_PKGS == 0 )); then
   fi
 fi
 
+# Reclaim apt package cache (.deb archives from QEMU + deps can consume 100-250 MB)
+if command -v apt-get >/dev/null 2>&1; then
+  info "Cleaning apt package cache to free storage..."
+  apt-get clean >/dev/null 2>&1 || true
+fi
+if [[ -n "${PREFIX:-}" && -d "${PREFIX}/var/cache/apt/archives" ]]; then
+  rm -f "${PREFIX}/var/cache/apt/archives/"*.deb 2>/dev/null || true
+fi
+
 for req in mke2fs ssh ssh-keygen curl tar gzip python3; do
   command -v "$req" >/dev/null 2>&1 || die "Required command '$req' not found."
 done
 qemu_bin_for_host >/dev/null || die "qemu-system-aarch64 not found."
 
-# Step 2: Prepare directories & fetch upstream artifacts
+# Step 2: Prepare directories, clean stale temp files, check free space & fetch artifacts
 mkdir -p "$DATA_DIR" "$CACHE_DIR" "$VM_DIR" "$SSH_DIR" "$BIN_DIR"
 chmod 0700 "$SSH_DIR"
+rm -rf "$VM_DIR"/staging.* "$CACHE_DIR"/*.part.* 2>/dev/null || true
+
+avail_mb="$(df -Pm "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+if [[ "$avail_mb" =~ ^[0-9]+$ && "$avail_mb" -gt 0 ]]; then
+  if (( avail_mb < 150 )); then
+    die "Only ${avail_mb} MB free on $(df -h "$DATA_DIR" | awk 'NR==2 {print $1}'). At least ~400 MB free space is required to download and extract Antigravity CLI (~87 MB download + ~230 MB extracted + ~40 MB Alpine). Free space on your phone and re-run install.sh."
+  elif (( avail_mb < 400 )); then
+    warn "Low disk space: ${avail_mb} MB free (~400 MB recommended during install; final footprint ~290 MB)."
+  fi
+fi
 
 download_agy_tarball
 download_alpine_assets
@@ -206,6 +228,9 @@ python3 "$REPO_DIR/lib/build_initrd.py" \
   --base "$FETCH_ALPINE_INITRAMFS" \
   --init "$REPO_DIR/guest/init-agy" \
   --output "$INITRD_IMG"
+if (( KEEP_CACHE == 0 )); then
+  rm -f "$FETCH_ALPINE_INITRAMFS"
+fi
 
 # Step 4: Generate SSH keypair for rootless localhost PTY/exec bridge
 if [[ ! -f "$SSH_KEY" || ! -f "$SSH_PUB" ]]; then
@@ -216,7 +241,7 @@ fi
 chmod 0600 "$SSH_KEY"
 chmod 0644 "$SSH_PUB"
 
-# Step 5: Build sparse ext4 rootfs image
+# Step 5: Build sparse ext4 rootfs image (defers 228 MB agy extraction to VM first boot)
 build_rootfs_image \
   "$FETCH_ALPINE_ROOTFS" \
   "$FETCH_AGY_TARBALL" \
@@ -225,6 +250,9 @@ build_rootfs_image \
   "$VM_DISK_MB" \
   "$FETCH_ALPINE_BRANCH" \
   "$REPO_DIR/guest"
+if (( KEEP_CACHE == 0 )); then
+  rm -f "$FETCH_ALPINE_ROOTFS"
+fi
 
 # Step 6: Install runtime scripts & thin wrappers
 mkdir -p "$DATA_DIR/bin" "$DATA_DIR/lib" "$DATA_DIR/guest"
@@ -270,9 +298,17 @@ case ":$PATH:" in
 esac
 
 if (( NO_START == 0 )); then
-  info "Booting micro-VM for first-time setup (downloads Dropbear + TLS certs)..."
+  info "Booting micro-VM for first-time setup (extracts agy + provisions Dropbear/TLS)..."
   "$BIN_DIR/agy-vm" start --wait
-  ok "Verified inside VM: $("$BIN_DIR/$BIN_NAME" --version 2>/dev/null || echo "ready")"
+  vm_agy_ver="$("$BIN_DIR/$BIN_NAME" --version 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$vm_agy_ver" ]]; then
+    ok "Verified inside VM: agy $vm_agy_ver"
+    if (( KEEP_CACHE == 0 )); then
+      rm -f "$FETCH_AGY_TARBALL"
+    fi
+  else
+    warn "VM started, but could not verify 'agy --version'. Check 'agy-vm logs'."
+  fi
 else
   info "Skipped VM start (--no-start). Start later with: agy-vm start --wait"
 fi

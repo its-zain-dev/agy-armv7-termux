@@ -79,7 +79,7 @@ PY
 
 cmd_start() {
   local wait_ready=0
-  local timeout=180
+  local timeout=240
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --wait) wait_ready=1; shift ;;
@@ -158,7 +158,7 @@ cmd_start() {
   fi
 
   if (( wait_ready == 1 )); then
-    local start_ts now_ts elapsed prov_noted=0
+    local start_ts now_ts elapsed prov_noted=0 extract_noted=0
     start_ts="$(date +%s)"
     while ! is_ssh_ready; do
       if ! is_vm_running; then
@@ -167,6 +167,10 @@ cmd_start() {
         tail -n 20 "$DATA_DIR/qemu.stderr.log" >&2 || true
         rm -f "$PID_FILE" "$MON_SOCK"
         return 1
+      fi
+      if (( extract_noted == 0 )) && grep -q "AGY_VM_EXTRACTING_AGY" "$VM_LOG" 2>/dev/null; then
+        info "First boot: extracting Antigravity CLI into VM..."
+        extract_noted=1
       fi
       if (( prov_noted == 0 )) && grep -q "AGY_VM_PROVISIONING" "$VM_LOG" 2>/dev/null; then
         info "First boot: provisioning Dropbear SSH and TLS certificates inside VM..."
@@ -323,23 +327,23 @@ cmd_update() {
   cmd_ensure_ready
   download_agy_tarball
 
-  local tmp_dir
-  tmp_dir="$(mktemp -d "${CACHE_DIR}/upd.XXXXXX")"
-  trap 'rm -rf "$tmp_dir" 2>/dev/null || true' RETURN
+  info "Streaming and installing Antigravity CLI v${FETCH_AGY_VERSION} into VM..."
+  run_vm_ssh 'sh -eu -c '\''
+    rm -rf /var/tmp/agy_upd
+    mkdir -p /var/tmp/agy_upd
+    gzip -dc | tar -xf - -C /var/tmp/agy_upd
+    src=""
+    if [ -f /var/tmp/agy_upd/antigravity ]; then src=/var/tmp/agy_upd/antigravity
+    elif [ -f /var/tmp/agy_upd/agy ]; then src=/var/tmp/agy_upd/agy
+    else src="$(find /var/tmp/agy_upd -maxdepth 3 -type f \( -name antigravity -o -name agy \) | head -n 1 || true)"
+    fi
+    [ -n "$src" ] && [ -f "$src" ]
+    chmod 0755 "$src"
+    mv -f "$src" /usr/local/bin/agy
+    rm -rf /var/tmp/agy_upd
+  '\''' < "$FETCH_AGY_TARBALL"
 
-  tar -xzf "$FETCH_AGY_TARBALL" -C "$tmp_dir" --no-same-owner
-  local new_bin=""
-  if [[ -f "$tmp_dir/antigravity" ]]; then
-    new_bin="$tmp_dir/antigravity"
-  elif [[ -f "$tmp_dir/agy" ]]; then
-    new_bin="$tmp_dir/agy"
-  else
-    new_bin="$(find "$tmp_dir" -maxdepth 3 -type f \( -name antigravity -o -name agy \) | head -n 1 || true)"
-  fi
-  [[ -n "$new_bin" && -f "$new_bin" ]] || die "Extracted tarball missing antigravity binary."
-
-  info "Installing Antigravity CLI v${FETCH_AGY_VERSION} into VM..."
-  run_vm_ssh 'cat > /usr/local/bin/agy.new && chmod 0755 /usr/local/bin/agy.new && mv -f /usr/local/bin/agy.new /usr/local/bin/agy' < "$new_bin"
+  rm -f "$FETCH_AGY_TARBALL"
   local installed_ver
   installed_ver="$(run_vm_ssh /usr/local/bin/agy --version 2>/dev/null | tail -n 1 || true)"
   AGY_VERSION="$FETCH_AGY_VERSION"
