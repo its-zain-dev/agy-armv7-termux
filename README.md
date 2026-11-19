@@ -52,7 +52,21 @@ Key design details:
 
 ## Installation
 
+### Option 1: One-line install from GitHub (recommended)
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/its-zain-dev/agy-armv7-termux/main/install.sh | bash
+```
+
+Passing options with the one-liner (for example, custom RAM):
+```bash
+curl -fsSL https://raw.githubusercontent.com/its-zain-dev/agy-armv7-termux/main/install.sh | bash -s -- --ram 768M --cpus 2
+```
+
+### Option 2: Clone and install
+
+```bash
+pkg update -y && pkg install -y git curl
 git clone https://github.com/its-zain-dev/agy-armv7-termux.git
 cd agy-armv7-termux
 ./install.sh
@@ -62,7 +76,7 @@ What `install.sh` does:
 1. Detects your Termux architecture (`lib/detect.sh`).
 2. Installs `x11-repo`, `tur-repo`, `qemu-system-aarch64-9`, `e2fsprogs`, `openssh`, `curl`, `tar`, `gzip`, and `python`.
 3. Downloads and SHA512-verifies Google's `linux_arm64_musl` release and Alpine Linux `aarch64` assets.
-4. Generates an Ed25519 SSH keypair, builds `initramfs-agy.gz` and sparse `rootfs.img`, and installs `agy` and `agy-vm` wrappers into `~/.local/bin`.
+4. Generates an Ed25519 SSH keypair, builds `initramfs-agy.gz` and sparse `rootfs.img`, and installs `agy` and `agy-vm` wrappers into `$PREFIX/bin` (on Termux, immediately in `$PATH`) or `~/.local/bin`.
 5. Boots the VM (`agy-vm start --wait`), provisions Dropbear SSH and TLS CA certificates on first boot, and verifies `agy --version`.
 
 Useful installer flags:

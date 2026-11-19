@@ -1,12 +1,56 @@
 #!/usr/bin/env bash
 # Installer for agy-armv7-termux (Antigravity CLI ARMv7 Termux micro-VM port).
+# Works both from a local git clone and when piped via:
+#   curl -fsSL https://raw.githubusercontent.com/its-zain-dev/agy-armv7-termux/main/install.sh | bash
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGY_PORT_REPO="${AGY_PORT_REPO:-its-zain-dev/agy-armv7-termux}"
+AGY_PORT_BRANCH="${AGY_PORT_BRANCH:-main}"
+
+SCRIPT_SRC="${BASH_SOURCE[0]:-}"
+REPO_DIR=""
+if [[ -n "$SCRIPT_SRC" && -f "$SCRIPT_SRC" ]]; then
+  REPO_DIR="$(cd "$(dirname "$SCRIPT_SRC")" && pwd)"
+fi
+
+# Self-bootstrap from GitHub archive when invoked via curl | bash (no sibling lib/common.sh)
+if [[ -z "$REPO_DIR" || ! -f "$REPO_DIR/lib/common.sh" ]]; then
+  if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+    if command -v pkg >/dev/null 2>&1; then
+      echo "[..] Installing curl and tar via pkg..." >&2
+      pkg update -y
+      pkg install -y curl tar gzip
+    else
+      echo "[ERR] curl and tar are required to bootstrap agy-armv7-termux." >&2
+      exit 1
+    fi
+  fi
+
+  BOOTSTRAP_TMP="$(mktemp -d "${TMPDIR:-/tmp}/agy-armv7-bootstrap.XXXXXX")"
+  trap 'rm -rf "$BOOTSTRAP_TMP" 2>/dev/null || true' EXIT
+  ARCHIVE_URL="https://github.com/${AGY_PORT_REPO}/archive/refs/heads/${AGY_PORT_BRANCH}.tar.gz"
+  echo "[..] Downloading ${AGY_PORT_REPO} (${AGY_PORT_BRANCH}) from GitHub..." >&2
+  curl -fsSL "$ARCHIVE_URL" | tar -xz -C "$BOOTSTRAP_TMP"
+  EXTRACTED_DIR="$(find "$BOOTSTRAP_TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [[ -z "$EXTRACTED_DIR" || ! -f "$EXTRACTED_DIR/install.sh" ]]; then
+    echo "[ERR] Failed to unpack agy-armv7-termux archive from $ARCHIVE_URL" >&2
+    exit 1
+  fi
+  chmod +x "$EXTRACTED_DIR/install.sh"
+  set +e
+  "$EXTRACTED_DIR/install.sh" "$@"
+  rc=$?
+  set -e
+  exit "$rc"
+fi
 
 # Parse flags early so --data-dir takes effect before sourcing common.sh
-BIN_DIR="$HOME/.local/bin"
+if [[ -n "${PREFIX:-}" && -d "${PREFIX}/bin" && -w "${PREFIX}/bin" ]]; then
+  BIN_DIR="${PREFIX}/bin"
+else
+  BIN_DIR="$HOME/.local/bin"
+fi
 BIN_NAME="agy"
 ARG_DATA_DIR=""
 ARG_RAM=""
@@ -25,7 +69,7 @@ Installs the ARMv7 Android Termux port of Google Antigravity CLI (agy)
 using a lightweight Alpine Linux aarch64 micro-VM.
 
 Options:
-  --bin-dir <dir>     Directory for wrapper executables (default: ~/.local/bin)
+  --bin-dir <dir>     Directory for wrapper executables (default: \$PREFIX/bin in Termux, else ~/.local/bin)
   --bin-name <name>   Name for the CLI wrapper (default: agy)
   --data-dir <dir>    Directory for VM images & state (default: ~/.local/share/agy-armv7)
   --ram <size>        VM RAM size, e.g. 512M, 768M, 1024M (default: auto)
