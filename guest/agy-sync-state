@@ -1,0 +1,72 @@
+#!/bin/sh
+# Sync non-SQLite Antigravity auth/config state between 9pfs hosthome and VM ext4.
+# Must remain strict POSIX sh compatible with BusyBox ash.
+
+set -eu
+
+AGY_HOST_STATE_DIR="${AGY_HOST_STATE_DIR:-/mnt/hosthome/.gemini/antigravity-cli}"
+AGY_VM_STATE_DIR="${AGY_VM_STATE_DIR:-/var/lib/agy-state}"
+
+cmd="${1:-}"
+
+sync_file_if_newer() {
+  src="$1"
+  dst="$2"
+  mode="$3"
+  [ -f "$src" ] || return 0
+  if [ ! -f "$dst" ] || [ "$src" -nt "$dst" ]; then
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+    if [ -n "$mode" ]; then
+      chmod "$mode" "$dst" 2>/dev/null || true
+    fi
+  fi
+}
+
+is_sqlite_file() {
+  case "$1" in
+    *.db|*.db-wal|*.db-shm|*.db-journal|*.sqlite|*.sqlite-wal|*.sqlite-shm|*.sqlite-journal)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+sync_skills_dir() {
+  src_dir="$1"
+  dst_dir="$2"
+  [ -d "$src_dir" ] || return 0
+  mkdir -p "$dst_dir"
+  find "$src_dir" -type f | while IFS= read -r f; do
+    rel="${f#"$src_dir"/}"
+    if is_sqlite_file "$rel"; then
+      continue
+    fi
+    sync_file_if_newer "$f" "$dst_dir/$rel" ""
+  done
+}
+
+case "$cmd" in
+  pull)
+    mkdir -p "$AGY_VM_STATE_DIR"
+    [ -d "$AGY_HOST_STATE_DIR" ] || exit 0
+    sync_file_if_newer "$AGY_HOST_STATE_DIR/antigravity-oauth-token" "$AGY_VM_STATE_DIR/antigravity-oauth-token" "0600"
+    sync_file_if_newer "$AGY_HOST_STATE_DIR/settings.json" "$AGY_VM_STATE_DIR/settings.json" ""
+    sync_file_if_newer "$AGY_HOST_STATE_DIR/GEMINI.md" "$AGY_VM_STATE_DIR/GEMINI.md" ""
+    sync_skills_dir "$AGY_HOST_STATE_DIR/skills" "$AGY_VM_STATE_DIR/skills"
+    ;;
+  push)
+    mkdir -p "$AGY_HOST_STATE_DIR" 2>/dev/null || exit 0
+    [ -d "$AGY_VM_STATE_DIR" ] || exit 0
+    sync_file_if_newer "$AGY_VM_STATE_DIR/antigravity-oauth-token" "$AGY_HOST_STATE_DIR/antigravity-oauth-token" "0600"
+    sync_file_if_newer "$AGY_VM_STATE_DIR/settings.json" "$AGY_HOST_STATE_DIR/settings.json" ""
+    sync_file_if_newer "$AGY_VM_STATE_DIR/GEMINI.md" "$AGY_HOST_STATE_DIR/GEMINI.md" ""
+    sync_skills_dir "$AGY_VM_STATE_DIR/skills" "$AGY_HOST_STATE_DIR/skills"
+    ;;
+  *)
+    echo "Usage: agy-sync-state {pull|push}" >&2
+    exit 1
+    ;;
+esac

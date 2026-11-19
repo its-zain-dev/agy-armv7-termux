@@ -1,0 +1,73 @@
+#!/bin/sh
+# Early initramfs bootstrap for agy-armv7-termux (rdinit=/init-agy).
+# Must remain strict POSIX sh compatible with BusyBox ash.
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+fail() {
+  echo "init-agy FATAL: $*" >/dev/console 2>&1 || echo "init-agy FATAL: $*" >&2
+  sync
+  sleep 5
+  poweroff -f 2>/dev/null || exit 1
+}
+
+mkdir -p /proc /sys /dev /sysroot /.modloop /lib/modules
+
+mount -t proc proc /proc || fail "failed to mount /proc"
+mount -t sysfs sysfs /sys || fail "failed to mount /sys"
+mount -t devtmpfs devtmpfs /dev || fail "failed to mount devtmpfs"
+
+modprobe -a virtio_blk squashfs 2>/dev/null || true
+
+# Poll up to 15 seconds (150 x 0.1s) for virtio block devices
+i=0
+while [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; do
+  if command -v mdev >/dev/null 2>&1; then
+    mdev -s 2>/dev/null || true
+  fi
+  i=$((i + 1))
+  if [ "$i" -ge 150 ]; then
+    fail "timed out waiting for /dev/vda and /dev/vdb"
+  fi
+  sleep 0.1
+done
+
+mount -t squashfs -o ro /dev/vdb /.modloop || fail "failed to mount /dev/vdb modloop"
+
+# Locate module tree inside modloop (handles usr-merged or non-usr-merged layouts)
+moddir=""
+for cand in /.modloop/modules /.modloop/usr/lib/modules /.modloop/lib/modules; do
+  if [ -d "$cand" ]; then
+    moddir="$cand"
+    break
+  fi
+done
+[ -n "$moddir" ] || fail "could not locate modules directory in /.modloop"
+
+mount --bind "$moddir" /lib/modules || fail "failed to bind-mount $moddir to /lib/modules"
+
+modprobe ext4 2>/dev/null || true
+
+umount /lib/modules 2>/dev/null || true
+umount /.modloop 2>/dev/null || true
+
+mount -t ext4 -o rw,noatime /dev/vda /sysroot || fail "failed to mount /dev/vda on /sysroot"
+
+# Hand live /dev into real rootfs so static device nodes are not required
+mkdir -p /sysroot/dev
+mount --move /dev /sysroot/dev || fail "failed to move /dev to /sysroot/dev"
+
+umount /proc 2>/dev/null || true
+umount /sys 2>/dev/null || true
+
+INIT=""
+for cand in /sbin/agy-init /usr/sbin/agy-init; do
+  if [ -x "/sysroot$cand" ]; then
+    INIT="$cand"
+    break
+  fi
+done
+[ -n "$INIT" ] || fail "agy-init not found in /sysroot"
+
+exec switch_root /sysroot "$INIT"
+fail "switch_root failed"

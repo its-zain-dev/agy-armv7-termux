@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# User-facing wrapper that runs Antigravity CLI (agy) transparently inside the Alpine aarch64 VM.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${AGY_VM_LIB_DIR:-}" && -d "$AGY_VM_LIB_DIR" ]]; then
+  LIB_DIR="$AGY_VM_LIB_DIR"
+elif [[ -d "$SCRIPT_DIR/../lib" ]]; then
+  LIB_DIR="$SCRIPT_DIR/../lib"
+elif [[ -d "${AGY_VM_DATA_DIR:-$HOME/.local/share/agy-armv7}/lib" ]]; then
+  LIB_DIR="${AGY_VM_DATA_DIR:-$HOME/.local/share/agy-armv7}/lib"
+else
+  echo "agy: could not locate agy-armv7-termux lib directory" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+. "$LIB_DIR/common.sh"
+load_config
+
+if [[ -n "${AGY_VM_BIN:-}" && -x "$AGY_VM_BIN" ]]; then
+  AGY_VM_CMD="$AGY_VM_BIN"
+elif [[ -x "$SCRIPT_DIR/agy-vm" ]]; then
+  AGY_VM_CMD="$SCRIPT_DIR/agy-vm"
+elif command -v agy-vm >/dev/null 2>&1; then
+  AGY_VM_CMD="$(command -v agy-vm)"
+else
+  die "Cannot find agy-vm control script."
+fi
+
+[[ -f "$SSH_KEY" ]] || die "VM is not initialized (missing $SSH_KEY). Run install.sh first."
+
+# Ensure VM is booted and SSH is accepting connections
+"$AGY_VM_CMD" ensure-ready
+
+# Resolve working directory inside VM
+req_cwd="$PWD"
+case "$req_cwd" in
+  "$AGY_HOME"|"$AGY_HOME"/*)
+    vm_cwd="$req_cwd"
+    ;;
+  *)
+    warn "Current directory '$req_cwd' is outside \$HOME ($AGY_HOME); running inside $AGY_HOME."
+    vm_cwd="$AGY_HOME"
+    ;;
+esac
+
+# Use PTY when both stdin and stdout are terminals; otherwise clean pipes
+if [[ -t 0 && -t 1 ]]; then
+  ssh_tty="-tt"
+else
+  ssh_tty="-T"
+fi
+
+ssh_opts=(
+  -i "$SSH_KEY"
+  -p "$VM_SSH_PORT"
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -o ConnectTimeout=5
+  -o ServerAliveInterval=30
+)
+
+remote_cmd=(/usr/local/bin/agy-exec --cwd "$(b64_encode_sentinel "$vm_cwd")")
+
+for var in TERM COLORTERM LANG LC_ALL TZ GEMINI_API_KEY GOOGLE_API_KEY HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+  if [[ -n "${!var+x}" ]]; then
+    remote_cmd+=(--env "$(b64_encode_sentinel "$var"):$(b64_encode_sentinel "${!var}")")
+  fi
+done
+
+remote_cmd+=(--)
+for arg in "$@"; do
+  remote_cmd+=("$(b64_encode_sentinel "$arg")")
+done
+
+set +e
+ssh "$ssh_tty" "${ssh_opts[@]}" root@127.0.0.1 "${remote_cmd[@]}"
+rc=$?
+set -e
+exit "$rc"

@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# Lifecycle manager for the Alpine aarch64 micro-VM running Antigravity CLI (agy).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${AGY_VM_LIB_DIR:-}" && -d "$AGY_VM_LIB_DIR" ]]; then
+  LIB_DIR="$AGY_VM_LIB_DIR"
+elif [[ -d "$SCRIPT_DIR/../lib" ]]; then
+  LIB_DIR="$SCRIPT_DIR/../lib"
+elif [[ -d "${AGY_VM_DATA_DIR:-$HOME/.local/share/agy-armv7}/lib" ]]; then
+  LIB_DIR="${AGY_VM_DATA_DIR:-$HOME/.local/share/agy-armv7}/lib"
+else
+  echo "agy-vm: could not locate agy-armv7-termux lib directory" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+. "$LIB_DIR/common.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/detect.sh"
+
+load_config
+
+vm_ssh_opts() {
+  printf '%s\n' \
+    "-i" "$SSH_KEY" \
+    "-p" "$VM_SSH_PORT" \
+    "-o" "BatchMode=yes" \
+    "-o" "StrictHostKeyChecking=no" \
+    "-o" "UserKnownHostsFile=/dev/null" \
+    "-o" "LogLevel=ERROR" \
+    "-o" "ConnectTimeout=3" \
+    "-o" "ServerAliveInterval=30"
+}
+
+run_vm_ssh() {
+  local opts=()
+  local line
+  while IFS= read -r line; do
+    opts+=("$line")
+  done < <(vm_ssh_opts)
+  ssh "${opts[@]}" root@127.0.0.1 "$@"
+}
+
+is_vm_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "qemu-system"; then
+      return 0
+    fi
+    return 1
+  fi
+  return 0
+}
+
+is_ssh_ready() {
+  [[ -f "$SSH_KEY" ]] || return 1
+  run_vm_ssh true >/dev/null 2>&1
+}
+
+qemu_monitor_quit() {
+  [[ -S "$MON_SOCK" ]] || return 1
+  python3 - "$MON_SOCK" <<'PY' >/dev/null 2>&1 || true
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sys.argv[1])
+time.sleep(0.1)
+s.sendall(b"quit\n")
+time.sleep(0.1)
+s.close()
+PY
+}
+
+cmd_start() {
+  local wait_ready=0
+  local timeout=180
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --wait) wait_ready=1; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      *) die "Unknown option for start: $1" ;;
+    esac
+  done
+
+  acquire_lock "$LOCK_DIR" 60 || die "Timed out waiting for VM lock ($LOCK_DIR)."
+  trap 'release_lock "$LOCK_DIR"' RETURN
+
+  if is_vm_running; then
+    if (( wait_ready == 1 )) && ! is_ssh_ready; then
+      info "VM is already starting; waiting for SSH..."
+    else
+      ok "VM is already running (PID $(cat "$PID_FILE"))."
+      return 0
+    fi
+  else
+    [[ -f "$KERNEL_IMG" ]]  || die "Missing kernel image: $KERNEL_IMG"
+    [[ -f "$INITRD_IMG" ]]  || die "Missing initramfs image: $INITRD_IMG"
+    [[ -f "$ROOTFS_IMG" ]]  || die "Missing rootfs image: $ROOTFS_IMG"
+    [[ -f "$MODLOOP_IMG" ]] || die "Missing modloop image: $MODLOOP_IMG"
+    [[ -f "$SSH_KEY" ]]     || die "Missing SSH key: $SSH_KEY"
+
+    local qemu_bin
+    qemu_bin="$(qemu_bin_for_host)" || die "qemu-system-aarch64 not found in PATH."
+
+    mkdir -p "$RUN_DIR" "$DATA_DIR"
+    rm -f "$PID_FILE" "$MON_SOCK"
+    : > "$VM_LOG"
+    local qemu_err="$DATA_DIR/qemu.stderr.log"
+    : > "$qemu_err"
+
+    local virtfs_args=(-virtfs "local,path=${AGY_HOME},mount_tag=hosthome,security_model=none,id=hosthome")
+    local storage_kopt=""
+    if [[ "${AGY_STORAGE:-0}" == "1" && -d "${AGY_HOME}/storage" ]]; then
+      virtfs_args+=(-virtfs "local,path=${AGY_HOME}/storage,mount_tag=hoststorage,security_model=none,id=hoststorage")
+      storage_kopt=" agy_storage=1"
+    fi
+
+    local tz_val="${TZ:-UTC}"
+    local cmdline="console=ttyAMA0 quiet rdinit=/init-agy agy_home=${AGY_HOME} agy_tz=${tz_val} agy_zram=${VM_ZRAM_MB}${storage_kopt}"
+
+    info "Starting Alpine aarch64 micro-VM (${VM_RAM} RAM, ${VM_CPUS} vCPU, zram ${VM_ZRAM_MB}M, port ${VM_SSH_PORT})..."
+
+    nohup "$qemu_bin" \
+      -machine virt \
+      -cpu cortex-a53 \
+      -smp "$VM_CPUS" \
+      -m "$VM_RAM" \
+      -nographic \
+      -serial "file:$VM_LOG" \
+      -monitor "unix:$MON_SOCK,server,nowait" \
+      -kernel "$KERNEL_IMG" \
+      -initrd "$INITRD_IMG" \
+      -append "$cmdline" \
+      -drive "file=$ROOTFS_IMG,if=virtio,format=raw,cache=writeback" \
+      -drive "file=$MODLOOP_IMG,if=virtio,format=raw,readonly=on" \
+      "${virtfs_args[@]}" \
+      -netdev "user,id=net0,net=10.0.2.0/24,dhcpstart=10.0.2.15,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22" \
+      -device virtio-net-pci,netdev=net0 \
+      -device virtio-rng-pci \
+      </dev/null >/dev/null 2>"$qemu_err" &
+
+    local qpid=$!
+    printf '%s\n' "$qpid" > "$PID_FILE"
+
+    sleep 0.4
+    if ! is_vm_running; then
+      err "QEMU exited immediately. Diagnostics:"
+      cat "$qemu_err" >&2 || true
+      rm -f "$PID_FILE"
+      return 1
+    fi
+  fi
+
+  if (( wait_ready == 1 )); then
+    local start_ts now_ts elapsed prov_noted=0
+    start_ts="$(date +%s)"
+    while ! is_ssh_ready; do
+      if ! is_vm_running; then
+        err "VM stopped unexpectedly during boot. Last log lines:"
+        tail -n 30 "$VM_LOG" >&2 || true
+        tail -n 20 "$DATA_DIR/qemu.stderr.log" >&2 || true
+        rm -f "$PID_FILE" "$MON_SOCK"
+        return 1
+      fi
+      if (( prov_noted == 0 )) && grep -q "AGY_VM_PROVISIONING" "$VM_LOG" 2>/dev/null; then
+        info "First boot: provisioning Dropbear SSH and TLS certificates inside VM..."
+        prov_noted=1
+      fi
+      now_ts="$(date +%s)"
+      elapsed=$((now_ts - start_ts))
+      if (( elapsed >= timeout )); then
+        err "Timed out after ${timeout}s waiting for VM SSH on 127.0.0.1:${VM_SSH_PORT}."
+        tail -n 20 "$VM_LOG" >&2 || true
+        return 1
+      fi
+      sleep 1
+    done
+    ok "VM is ready (PID $(cat "$PID_FILE"))."
+  else
+    ok "VM started in background (PID $(cat "$PID_FILE"))."
+  fi
+}
+
+cmd_ensure_ready() {
+  if is_vm_running && is_ssh_ready; then
+    return 0
+  fi
+  cmd_start --wait
+}
+
+cmd_stop() {
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) die "Unknown option for stop: $1" ;;
+    esac
+  done
+
+  acquire_lock "$LOCK_DIR" 30 || die "Timed out waiting for VM lock."
+  trap 'release_lock "$LOCK_DIR"' RETURN
+
+  if ! is_vm_running; then
+    rm -f "$PID_FILE" "$MON_SOCK"
+    info "VM is not running."
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  info "Stopping VM (PID $pid)..."
+
+  if (( force == 0 )) && is_ssh_ready; then
+    run_vm_ssh /usr/local/sbin/agy-poweroff >/dev/null 2>&1 || true
+    local i=0
+    while (( i < 30 )); do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PID_FILE" "$MON_SOCK"
+        ok "VM stopped cleanly."
+        return 0
+      fi
+      sleep 0.5
+      i=$((i + 1))
+    done
+  fi
+
+  qemu_monitor_quit || true
+  sleep 1
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 0.5
+  fi
+
+  rm -f "$PID_FILE" "$MON_SOCK"
+  ok "VM stopped."
+}
+
+cmd_restart() {
+  cmd_stop "$@"
+  cmd_start --wait
+}
+
+cmd_status() {
+  local state="stopped"
+  local pid="-"
+  local ssh_state="unreachable"
+  local agy_ver="-"
+
+  if is_vm_running; then
+    state="running"
+    pid="$(cat "$PID_FILE")"
+    if is_ssh_ready; then
+      ssh_state="ready"
+      agy_ver="$(run_vm_ssh /usr/local/bin/agy --version 2>/dev/null | tail -n 1 || echo "unknown")"
+    fi
+  fi
+
+  local disk_used="-"
+  if [[ -f "$ROOTFS_IMG" ]]; then
+    disk_used="$(du -h "$ROOTFS_IMG" 2>/dev/null | awk '{print $1}')"
+  fi
+
+  printf 'VM Status:   %s (PID: %s)\n' "$state" "$pid"
+  printf 'SSH Ready:   %s (127.0.0.1:%s)\n' "$ssh_state" "$VM_SSH_PORT"
+  printf 'Resources:   RAM=%s, vCPUs=%s, zram=%sM\n' "$VM_RAM" "$VM_CPUS" "$VM_ZRAM_MB"
+  printf 'Disk Image:  %s (%s)\n' "$ROOTFS_IMG" "$disk_used"
+  printf 'agy Version: %s\n' "$agy_ver"
+}
+
+cmd_shell() {
+  cmd_ensure_ready
+  local opts=()
+  local line
+  while IFS= read -r line; do
+    opts+=("$line")
+  done < <(vm_ssh_opts)
+
+  local target_dir="$AGY_HOME"
+  case "$PWD" in
+    "$AGY_HOME"|"$AGY_HOME"/*) target_dir="$PWD" ;;
+  esac
+
+  exec ssh -tt "${opts[@]}" root@127.0.0.1 "cd $(printf '%q' "$target_dir") 2>/dev/null || cd $(printf '%q' "$AGY_HOME"); exec /bin/bash -l"
+}
+
+cmd_logs() {
+  local follow=0
+  if [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]]; then
+    follow=1
+  fi
+  [[ -f "$VM_LOG" ]] || die "No VM log found at $VM_LOG"
+  if (( follow == 1 )); then
+    tail -n 100 -f "$VM_LOG"
+  else
+    cat "$VM_LOG"
+  fi
+}
+
+cmd_sync_auth() {
+  local action="${1:-push}"
+  case "$action" in
+    pull|push) ;;
+    *) die "Usage: agy-vm sync-auth [pull|push]" ;;
+  esac
+  cmd_ensure_ready
+  run_vm_ssh /usr/local/sbin/agy-sync-state "$action"
+  ok "Auth/config state synced ($action)."
+}
+
+cmd_update() {
+  # shellcheck disable=SC1091
+  . "$LIB_DIR/fetch.sh"
+  cmd_ensure_ready
+  download_agy_tarball
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d "${CACHE_DIR}/upd.XXXXXX")"
+  trap 'rm -rf "$tmp_dir" 2>/dev/null || true' RETURN
+
+  tar -xzf "$FETCH_AGY_TARBALL" -C "$tmp_dir" --no-same-owner
+  local new_bin=""
+  if [[ -f "$tmp_dir/antigravity" ]]; then
+    new_bin="$tmp_dir/antigravity"
+  elif [[ -f "$tmp_dir/agy" ]]; then
+    new_bin="$tmp_dir/agy"
+  else
+    new_bin="$(find "$tmp_dir" -maxdepth 3 -type f \( -name antigravity -o -name agy \) | head -n 1 || true)"
+  fi
+  [[ -n "$new_bin" && -f "$new_bin" ]] || die "Extracted tarball missing antigravity binary."
+
+  info "Installing Antigravity CLI v${FETCH_AGY_VERSION} into VM..."
+  run_vm_ssh 'cat > /usr/local/bin/agy.new && chmod 0755 /usr/local/bin/agy.new && mv -f /usr/local/bin/agy.new /usr/local/bin/agy' < "$new_bin"
+  local installed_ver
+  installed_ver="$(run_vm_ssh /usr/local/bin/agy --version 2>/dev/null | tail -n 1 || true)"
+  AGY_VERSION="$FETCH_AGY_VERSION"
+  save_config
+  ok "Updated VM agy to ${installed_ver:-$FETCH_AGY_VERSION}."
+}
+
+cmd_config() {
+  local sub="${1:-show}"
+  case "$sub" in
+    show)
+      printf 'DATA_DIR=%s\n' "$DATA_DIR"
+      printf 'CONF_FILE=%s\n' "$CONF_FILE"
+      printf 'VM_RAM=%s\n' "$VM_RAM"
+      printf 'VM_CPUS=%s\n' "$VM_CPUS"
+      printf 'VM_ZRAM_MB=%s\n' "$VM_ZRAM_MB"
+      printf 'VM_SSH_PORT=%s\n' "$VM_SSH_PORT"
+      printf 'VM_DISK_MB=%s\n' "$VM_DISK_MB"
+      printf 'AGY_HOME=%s\n' "$AGY_HOME"
+      printf 'AGY_STORAGE=%s\n' "$AGY_STORAGE"
+      ;;
+    set)
+      local key="${2:-}"
+      local val="${3:-}"
+      [[ -n "$key" && -n "$val" ]] || die "Usage: agy-vm config set <ram|cpus|zram|port> <value>"
+      case "$key" in
+        ram)
+          if [[ ! "$val" =~ ^([0-9]+)([MG])$ ]]; then
+            die "Invalid RAM format '$val'. Use e.g. 512M, 768M, 1024M, or 2G."
+          fi
+          local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+          local mb="$num"
+          [[ "$unit" == "G" ]] && mb=$((num * 1024))
+          (( mb >= 256 )) || die "RAM must be at least 256M."
+          VM_RAM="$val"
+          ;;
+        cpus)
+          [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 8 )) || die "CPUs must be an integer between 1 and 8."
+          VM_CPUS="$val"
+          ;;
+        zram)
+          [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 0 && val <= 4096 )) || die "zram must be an integer between 0 and 4096 (MB)."
+          VM_ZRAM_MB="$val"
+          ;;
+        port)
+          [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1024 && val <= 65535 )) || die "port must be between 1024 and 65535."
+          VM_SSH_PORT="$val"
+          ;;
+        *)
+          die "Unknown config key '$key'. Valid keys: ram, cpus, zram, port"
+          ;;
+      esac
+      save_config
+      ok "Saved $key=$val to $CONF_FILE"
+      if is_vm_running; then
+        info "Run 'agy-vm restart' for changes to take effect."
+      fi
+      ;;
+    *)
+      die "Usage: agy-vm config [show | set <ram|cpus|zram|port> <value>]"
+      ;;
+  esac
+}
+
+cmd_doctor() {
+  local env_kind qemu_bin=""
+  env_kind="$(detect_environment)"
+  qemu_bin="$(qemu_bin_for_host || true)"
+
+  printf '=== agy-armv7-termux doctor (v%s) ===\n' "$AGY_PORT_VERSION"
+  printf 'Host Kernel/Arch:  %s (%s)\n' "$(uname -m)" "$(uname -o 2>/dev/null || uname -s)"
+  printf 'Detected Profile:  %s\n' "$env_kind"
+  if command -v getprop >/dev/null 2>&1; then
+    printf 'Android abilist64: %s\n' "$(getprop ro.product.cpu.abilist64 2>/dev/null || echo "<none>")"
+  fi
+  printf 'Host Linker64:     %s\n' "$([[ -e /system/bin/linker64 ]] && echo "present" || echo "absent")"
+  printf 'QEMU Binary:       %s\n' "${qemu_bin:-NOT FOUND}"
+  if [[ -n "$qemu_bin" ]]; then
+    printf 'QEMU Version:      %s\n' "$("$qemu_bin" --version 2>/dev/null | head -n 1 || echo "unknown")"
+  fi
+
+  printf 'Host Tools:        '
+  local tool missing=()
+  for tool in mke2fs ssh ssh-keygen curl tar gzip python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing+=("$tool")
+    fi
+  done
+  if (( ${#missing[@]} == 0 )); then
+    printf 'all present\n'
+  else
+    printf 'missing: %s\n' "${missing[*]}"
+  fi
+
+  if [[ -r /proc/meminfo ]]; then
+    printf 'Host MemTotal:     %s\n' "$(awk '/^MemTotal:/ { printf "%.0f MB", $2/1024; exit }' /proc/meminfo)"
+  fi
+  printf 'Data Dir Space:    %s\n' "$(df -h "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4 " free of " $2}' || echo "unknown")"
+
+  printf 'VM Assets:\n'
+  local asset
+  for asset in "$KERNEL_IMG" "$INITRD_IMG" "$MODLOOP_IMG" "$ROOTFS_IMG" "$SSH_KEY"; do
+    if [[ -f "$asset" ]]; then
+      printf '  [OK]   %s (%s)\n' "$asset" "$(du -h "$asset" 2>/dev/null | awk '{print $1}')"
+    else
+      printf '  [MISS] %s\n' "$asset"
+    fi
+  done
+
+  cmd_status
+}
+
+cmd_uninstall() {
+  local purge=0
+  if [[ "${1:-}" == "--purge" ]]; then
+    purge=1
+  fi
+
+  cmd_stop --force >/dev/null 2>&1 || true
+
+  local bin_dir_guess=""
+  for cand in "$HOME/.local/bin" "${PREFIX:-/data/data/com.termux/files/usr}/bin"; do
+    if [[ -f "$cand/agy-vm" ]]; then
+      bin_dir_guess="$cand"
+      break
+    fi
+  done
+
+  if [[ -n "$bin_dir_guess" ]]; then
+    if [[ -f "$bin_dir_guess/${BIN_NAME:-agy}" ]] && grep -q "AGY_VM_DATA_DIR" "$bin_dir_guess/${BIN_NAME:-agy}" 2>/dev/null; then
+      rm -f "$bin_dir_guess/${BIN_NAME:-agy}"
+    fi
+    if [[ -f "$bin_dir_guess/agy-vm" ]] && grep -q "AGY_VM_DATA_DIR" "$bin_dir_guess/agy-vm" 2>/dev/null; then
+      rm -f "$bin_dir_guess/agy-vm"
+    fi
+  fi
+
+  rm -rf "$VM_DIR" "$RUN_DIR" "$SSH_DIR" "$DATA_DIR/bin" "$DATA_DIR/lib" "$DATA_DIR/guest" "$VM_LOG" "$DATA_DIR/qemu.stderr.log"
+  if (( purge == 1 )); then
+    rm -rf "$DATA_DIR"
+    ok "Uninstalled VM and purged all cached files and config in $DATA_DIR."
+  else
+    ok "Uninstalled VM runtime. Cached downloads/config preserved in $DATA_DIR (use --purge to remove all)."
+  fi
+}
+
+show_help() {
+  cat <<EOF
+Usage: agy-vm <command> [options]
+
+Commands:
+  start [--wait] [--timeout S]   Start the Alpine aarch64 micro-VM
+  stop [--force]                 Gracefully sync state and stop the VM
+  restart                        Restart the VM
+  status                         Show VM, SSH, disk, and agy version status
+  shell                          Open an interactive bash shell inside the VM
+  logs [-f]                      Print or tail VM console boot log
+  update                         Update agy inside the VM to the latest release
+  sync-auth [pull|push]          Sync auth/config between Termux \$HOME and VM
+  config [show | set K V]        Show or update VM settings (ram, cpus, zram, port)
+  doctor                         Diagnose architecture, QEMU, host tools, and VM state
+  uninstall [--purge]            Remove installed VM and wrappers
+EOF
+}
+
+case "${1:-help}" in
+  start)        shift; cmd_start "$@" ;;
+  ensure-ready) shift; cmd_ensure_ready "$@" ;;
+  stop)         shift; cmd_stop "$@" ;;
+  restart)      shift; cmd_restart "$@" ;;
+  status)       shift; cmd_status "$@" ;;
+  shell)        shift; cmd_shell "$@" ;;
+  logs)         shift; cmd_logs "$@" ;;
+  sync-auth)    shift; cmd_sync_auth "$@" ;;
+  update)       shift; cmd_update "$@" ;;
+  config)       shift; cmd_config "$@" ;;
+  doctor)       shift; cmd_doctor "$@" ;;
+  uninstall)    shift; cmd_uninstall "$@" ;;
+  -h|--help|help) show_help ;;
+  *) die "Unknown command '${1:-}'. Run 'agy-vm --help'." ;;
+esac

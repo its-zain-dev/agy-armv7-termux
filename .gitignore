@@ -1,0 +1,16 @@
+# Runtime and build artifacts
+*.img
+*.gz
+*.tar.gz
+*.log
+*.pid
+*.sock
+*.tmp
+.DS_Store
+__pycache__/
+*.py[cod]
+staging/
+cache/
+vm/
+ssh/
+config.env

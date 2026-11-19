@@ -1,0 +1,38 @@
+#!/bin/sh
+# Clean VM shutdown script for agy-armv7-termux.
+# Must remain strict POSIX sh compatible with BusyBox ash.
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ -f /run/agy-vm.env ]; then
+  . /run/agy-vm.env
+fi
+: "${AGY_HOME:=/root}"
+
+# Persist auth/settings back to Termux hosthome before unmounting
+/usr/local/sbin/agy-sync-state push >/dev/null 2>&1 || true
+
+# Stop SSH and any running user agy sessions gracefully
+pkill -TERM agy 2>/dev/null || true
+pkill -TERM dropbear 2>/dev/null || true
+sleep 1
+pkill -KILL agy 2>/dev/null || true
+
+sync
+
+# Unmount state, home, storage, and modloop cleanly
+umount "$AGY_HOME/.gemini/antigravity-cli" 2>/dev/null || umount -l "$AGY_HOME/.gemini/antigravity-cli" 2>/dev/null || true
+if [ "$AGY_HOME" != "/mnt/hosthome" ]; then
+  umount "$AGY_HOME/storage" 2>/dev/null || true
+  umount "$AGY_HOME" 2>/dev/null || umount -l "$AGY_HOME" 2>/dev/null || true
+fi
+umount /mnt/hoststorage 2>/dev/null || true
+umount /mnt/hosthome 2>/dev/null || umount -l /mnt/hosthome 2>/dev/null || true
+umount /lib/modules 2>/dev/null || true
+umount /.modloop 2>/dev/null || true
+
+sync
+mount -o remount,ro / 2>/dev/null || true
+sync
+
+exec poweroff -f

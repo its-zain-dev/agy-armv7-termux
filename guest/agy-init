@@ -1,0 +1,175 @@
+#!/bin/sh
+# PID 1 guest init for Alpine aarch64 VM in agy-armv7-termux.
+# Must remain strict POSIX sh compatible with BusyBox ash.
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+log() {
+  echo "[agy-init] $*" >/dev/console 2>&1 || echo "[agy-init] $*"
+}
+
+mkdir -p /proc /sys /dev/pts /dev/shm /run /tmp /.modloop /lib/modules /mnt/hosthome /var/lib/agy-state /etc/dropbear
+
+mountpoint_check() {
+  grep -q " $1 " /proc/mounts 2>/dev/null
+}
+
+[ -e /proc/mounts ] || mount -t proc proc /proc
+mountpoint_check /sys || mount -t sysfs sysfs /sys
+mountpoint_check /dev/pts || mount -t devpts devpts /dev/pts
+mountpoint_check /dev/shm || mount -t tmpfs -o mode=1777 tmpfs /dev/shm
+mountpoint_check /run || mount -t tmpfs -o mode=0755 tmpfs /run
+mountpoint_check /tmp || mount -t tmpfs -o mode=1777 tmpfs /tmp
+
+# Parse kernel command line overrides
+AGY_HOME="/root"
+AGY_TZ="UTC"
+AGY_ZRAM_MB="512"
+AGY_STORAGE="0"
+
+for opt in $(cat /proc/cmdline 2>/dev/null); do
+  case "$opt" in
+    agy_home=*)    AGY_HOME="${opt#agy_home=}" ;;
+    agy_tz=*)      AGY_TZ="${opt#agy_tz=}" ;;
+    agy_zram=*)    AGY_ZRAM_MB="${opt#agy_zram=}" ;;
+    agy_storage=*) AGY_STORAGE="${opt#agy_storage=}" ;;
+  esac
+done
+
+cat > /run/agy-vm.env <<EOF
+AGY_HOME='$AGY_HOME'
+AGY_TZ='$AGY_TZ'
+AGY_ZRAM_MB='$AGY_ZRAM_MB'
+AGY_STORAGE='$AGY_STORAGE'
+EOF
+export AGY_HOME AGY_TZ AGY_ZRAM_MB AGY_STORAGE
+
+# Mount modloop squashfs so kernel modules (9p, virtio_net, zram, etc.) are available
+if [ -b /dev/vdb ]; then
+  mount -t squashfs -o ro /dev/vdb /.modloop 2>/dev/null || true
+  for cand in /.modloop/modules /.modloop/usr/lib/modules /.modloop/lib/modules; do
+    if [ -d "$cand" ]; then
+      mount --bind "$cand" /lib/modules 2>/dev/null || true
+      break
+    fi
+  done
+fi
+
+for mod in virtio_net virtio_rng 9p 9pnet_virtio zram; do
+  modprobe "$mod" 2>/dev/null || true
+done
+
+# Hostname and instant static QEMU SLIRP network
+hostname agy-arm64 2>/dev/null || true
+ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+
+if ip link show eth0 >/dev/null 2>&1; then
+  ip addr flush dev eth0 2>/dev/null || true
+  ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null || true
+  ip link set eth0 up 2>/dev/null || true
+  ip route replace default via 10.0.2.2 dev eth0 2>/dev/null || route add default gw 10.0.2.2 eth0 2>/dev/null || true
+fi
+
+cat > /etc/resolv.conf <<'EOF'
+nameserver 10.0.2.3
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+
+# Configure zram swap so 512M-1G VMs handle agy memory spikes reliably
+if [ "${AGY_ZRAM_MB:-0}" -gt 0 ] 2>/dev/null && [ -b /dev/zram0 ]; then
+  swapoff /dev/zram0 2>/dev/null || true
+  echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+  echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || echo lzo-rle > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+  echo "${AGY_ZRAM_MB}M" > /sys/block/zram0/disksize 2>/dev/null || true
+  if mkswap /dev/zram0 >/dev/null 2>&1; then
+    swapon -p 100 /dev/zram0 2>/dev/null || true
+  fi
+fi
+
+# Repair rootfs permissions caused by rootless mke2fs -d on host Termux
+if [ ! -f /var/lib/agy-perms-fixed ]; then
+  chown -R 0:0 /root /etc /usr/local /var/lib/agy-state 2>/dev/null || true
+  if [ -f /etc/shadow ]; then
+    sed -i 's/^root:!:/root:*:/' /etc/shadow 2>/dev/null || true
+  fi
+  chmod 0700 /root /root/.ssh 2>/dev/null || true
+  chmod 0600 /root/.ssh/authorized_keys 2>/dev/null || true
+  chmod 0755 /usr/local/bin/agy /usr/local/bin/agy-exec /usr/local/sbin/agy-sync-state /usr/local/sbin/agy-poweroff 2>/dev/null || true
+  touch /var/lib/agy-perms-fixed
+fi
+
+# Mount Termux $HOME via 9pfs and bind to exact $AGY_HOME path so tool paths match 1:1
+mkdir -p "$AGY_HOME"
+if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=131072 hosthome /mnt/hosthome; then
+  if [ "$AGY_HOME" != "/mnt/hosthome" ]; then
+    mount --bind /mnt/hosthome "$AGY_HOME" || log "warn: failed to bind /mnt/hosthome -> $AGY_HOME"
+  fi
+else
+  log "warn: failed to mount 9p hosthome"
+fi
+
+if [ "$AGY_STORAGE" = "1" ]; then
+  mkdir -p /mnt/hoststorage
+  if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=131072 hoststorage /mnt/hoststorage 2>/dev/null; then
+    if [ -d "$AGY_HOME/storage" ] || mkdir -p "$AGY_HOME/storage" 2>/dev/null; then
+      mount --bind /mnt/hoststorage "$AGY_HOME/storage" 2>/dev/null || true
+    fi
+  fi
+fi
+
+# Isolate ~/.gemini/antigravity-cli on VM ext4 so SQLite WAL/SHM works without 9pfs corruption
+mkdir -p /var/lib/agy-state "/mnt/hosthome/.gemini/antigravity-cli" "$AGY_HOME/.gemini/antigravity-cli"
+/usr/local/sbin/agy-sync-state pull || true
+mount --bind /var/lib/agy-state "$AGY_HOME/.gemini/antigravity-cli" || log "warn: failed to bind /var/lib/agy-state"
+
+# First-boot package provisioning (Dropbear, bash, TLS certs, curl, git, ripgrep, coreutils, tzdata)
+if [ ! -f /var/lib/agy-provisioned ]; then
+  log "AGY_VM_PROVISIONING"
+  attempt=1
+  prov_ok=0
+  while [ "$attempt" -le 3 ]; do
+    if apk update && apk add --no-cache dropbear bash ca-certificates curl git ripgrep coreutils tzdata; then
+      prov_ok=1
+      break
+    fi
+    log "apk provisioning attempt $attempt failed; retrying in 2s..."
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+
+  if [ "$prov_ok" = "1" ]; then
+    sed -i 's|^\(root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:\).*|\1/bin/bash|' /etc/passwd 2>/dev/null || true
+    update-ca-certificates 2>/dev/null || true
+    touch /var/lib/agy-provisioned
+    log "AGY_VM_PROVISIONED"
+  else
+    log "AGY_VM_PROVISION_FAILED"
+  fi
+fi
+
+# Configure timezone if tzdata installed
+if [ -n "$AGY_TZ" ] && [ -f "/usr/share/zoneinfo/$AGY_TZ" ]; then
+  ln -sf "/usr/share/zoneinfo/$AGY_TZ" /etc/localtime 2>/dev/null || true
+fi
+
+# Start Dropbear SSH server (never pass -w, which would block root SSH)
+if command -v dropbear >/dev/null 2>&1; then
+  pkill -x dropbear 2>/dev/null || true
+  dropbear -R -s -g -E -p 22 >/var/log/dropbear.log 2>&1 || log "warn: dropbear failed to start"
+fi
+
+touch /run/agy-vm.ready
+log "AGY_VM_READY"
+
+# Clean shutdown handler
+on_shutdown() {
+  exec /usr/local/sbin/agy-poweroff
+}
+trap on_shutdown TERM INT USR2
+
+# PID 1 wait/reap loop
+while true; do
+  sleep 5 &
+  wait $! 2>/dev/null || true
+done
